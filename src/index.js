@@ -20,9 +20,13 @@ export default {
           return Response.json({ configured: false });
         }
 
-        const result = await env.DB.prepare(
-          "SELECT name, price, duration FROM services WHERE professional_id = 1 AND name NOT LIKE '[Arquivado] %' ORDER BY id"
-        ).all();
+        const result = await env.DB.prepare(`
+          SELECT name, price, duration
+          FROM services
+          WHERE professional_id = 1
+            AND name NOT LIKE '[Arquivado] %'
+          ORDER BY id
+        `).all();
 
         return Response.json({
           configured: true,
@@ -49,6 +53,12 @@ export default {
         const end = String(data.end || "18:00");
         const services = data.services;
 
+        const validTime = value => {
+          if (!/^\d{2}:\d{2}$/.test(value)) return false;
+          const [h, m] = value.split(":").map(Number);
+          return h >= 0 && h <= 23 && m >= 0 && m <= 59;
+        };
+
         if (!name || !category || !Array.isArray(services)) {
           return Response.json({
             error: "Confira o nome, a categoria e os servicos."
@@ -61,8 +71,7 @@ export default {
           }, { status: 400 });
         }
 
-        if (!/^\d{2}:\d{2}$/.test(start) ||
-            !/^\d{2}:\d{2}$/.test(end) || start >= end) {
+        if (!validTime(start) || !validTime(end) || start >= end) {
           return Response.json({
             error: "Confira os horarios de atendimento."
           }, { status: 400 });
@@ -80,7 +89,8 @@ export default {
             !Number.isFinite(Number(service.price)) ||
             Number(service.price) < 0 ||
             !Number.isInteger(Number(service.duration)) ||
-            Number(service.duration) < 1
+            Number(service.duration) < 1 ||
+            Number(service.duration) > 1440
           ) {
             return Response.json({
               error: "Confira os nomes, precos e duracoes dos servicos. Nao repita nomes."
@@ -103,8 +113,6 @@ export default {
             end_time = excluded.end_time
         `).bind(name, category, accent, days, start, end).run();
 
-        // Atualiza servicos existentes para preservar os IDs
-        // que podem estar ligados a agendamentos.
         const existingResult = await env.DB.prepare(
           "SELECT id, name FROM services WHERE professional_id = 1"
         ).all();
@@ -143,8 +151,6 @@ export default {
           }
         }
 
-        // Remove servicos retirados, mas preserva os usados
-        // em agendamentos anteriores.
         for (const item of existing) {
           if (usedIds.has(item.id)) continue;
 
@@ -176,13 +182,14 @@ export default {
       }
     }
 
-    // CONFIGURACAO PUBLICA PARA CLIENTES
+    // CONFIGURACAO PUBLICA
     if (url.pathname === "/api/public-config" &&
         request.method === "GET") {
       try {
-        const professional = await env.DB.prepare(
-          "SELECT name, category, accent_color, work_days, start_time, end_time FROM professionals WHERE id = 1"
-        ).first();
+        const professional = await env.DB.prepare(`
+          SELECT name, category, accent_color, work_days, start_time, end_time
+          FROM professionals WHERE id = 1
+        `).first();
 
         if (!professional) {
           return Response.json({
@@ -209,7 +216,143 @@ export default {
       }
     }
 
-    // RECEBER SOLICITACAO DE AGENDAMENTO
+    // CONSULTAR HORARIOS DISPONIVEIS
+    if (url.pathname === "/api/availability" &&
+        request.method === "GET") {
+      try {
+        const date = url.searchParams.get("date") || "";
+        const serviceId = Number(url.searchParams.get("service_id"));
+
+        if (
+          !/^\d{4}-\d{2}-\d{2}$/.test(date) ||
+          !Number.isInteger(serviceId)
+        ) {
+          return Response.json({
+            error: "Escolha a data e o servico."
+          }, { status: 400 });
+        }
+
+        const selectedDate = new Date(date + "T12:00:00Z");
+
+        if (
+          Number.isNaN(selectedDate.getTime()) ||
+          selectedDate.toISOString().slice(0, 10) !== date
+        ) {
+          return Response.json({
+            error: "Data invalida."
+          }, { status: 400 });
+        }
+
+        const today = new Intl.DateTimeFormat("en-CA", {
+          timeZone: "America/Sao_Paulo",
+          year: "numeric",
+          month: "2-digit",
+          day: "2-digit"
+        }).format(new Date());
+
+        if (date < today) {
+          return Response.json({ slots: [] });
+        }
+
+        const professional = await env.DB.prepare(
+          "SELECT * FROM professionals WHERE id = 1"
+        ).first();
+
+        const service = await env.DB.prepare(`
+          SELECT id, duration
+          FROM services
+          WHERE id = ? AND professional_id = 1
+            AND name NOT LIKE '[Arquivado] %'
+        `).bind(serviceId).first();
+
+        if (!professional || !service) {
+          return Response.json({
+            error: "Profissional ou servico nao encontrado."
+          }, { status: 404 });
+        }
+
+        const weekday = selectedDate.getUTCDay();
+        const days = professional.work_days || "Segunda a sexta";
+
+        if (
+          (days === "Segunda a sexta" &&
+            (weekday === 0 || weekday === 6)) ||
+          (days === "Segunda a sábado" && weekday === 0)
+        ) {
+          return Response.json({ slots: [] });
+        }
+
+        const toMinutes = value => {
+          const [h, m] = value.split(":").map(Number);
+          return h * 60 + m;
+        };
+
+        const opening = toMinutes(professional.start_time);
+        const closing = toMinutes(professional.end_time);
+        const duration = Number(service.duration);
+
+        const result = await env.DB.prepare(`
+          SELECT a.appointment_time, s.duration
+          FROM appointments a
+          JOIN services s ON s.id = a.service_id
+          WHERE a.professional_id = 1
+            AND a.appointment_date = ?
+            AND a.status != 'cancelled'
+        `).bind(date).all();
+
+        const occupied = result.results.map(item => {
+          const start = toMinutes(item.appointment_time);
+          return {
+            start,
+            end: start + Number(item.duration)
+          };
+        });
+
+        const slots = [];
+
+        // Horarios em intervalos de 30 minutos.
+        for (
+          let start = opening;
+          start + duration <= closing;
+          start += 30
+        ) {
+          const end = start + duration;
+
+          const conflict = occupied.some(item =>
+            start < item.end && end > item.start
+          );
+
+          if (!conflict) {
+            const hours = String(Math.floor(start / 60)).padStart(2, "0");
+            const minutes = String(start % 60).padStart(2, "0");
+            slots.push(hours + ":" + minutes);
+          }
+        }
+
+        // No dia atual, nao mostrar horarios que ja passaram.
+        if (date === today) {
+          const current = new Intl.DateTimeFormat("en-GB", {
+            timeZone: "America/Sao_Paulo",
+            hour: "2-digit",
+            minute: "2-digit",
+            hourCycle: "h23"
+          }).format(new Date());
+
+          const nowMinutes = toMinutes(current);
+          return Response.json({
+            slots: slots.filter(slot => toMinutes(slot) > nowMinutes)
+          });
+        }
+
+        return Response.json({ slots });
+      } catch (error) {
+        return Response.json({
+          error: "Nao foi possivel consultar os horarios."
+        }, { status: 500 });
+      }
+    }
+
+    // REGISTRAR SOLICITACAO DE AGENDAMENTO
     if (url.pathname === "/api/appointments" &&
         request.method === "POST") {
       try {
@@ -281,19 +424,20 @@ export default {
           }, { status: 400 });
         }
 
-        const timeParts = time.split(":").map(Number);
-        const requestedMinutes = timeParts[0] * 60 + timeParts[1];
+        const [hour, minute] = time.split(":").map(Number);
+        const requestedMinutes = hour * 60 + minute;
 
         if (
-          timeParts[0] > 23 ||
-          timeParts[1] > 59 ||
+          hour > 23 ||
+          minute > 59 ||
+          minute % 30 !== 0 ||
           time < professional.start_time ||
           requestedMinutes + Number(service.duration) >
             Number(professional.end_time.split(":")[0]) * 60 +
             Number(professional.end_time.split(":")[1])
         ) {
           return Response.json({
-            error: "Escolha um horario dentro do expediente."
+            error: "Escolha um dos horarios validos."
           }, { status: 400 });
         }
 
@@ -310,7 +454,21 @@ export default {
           }, { status: 400 });
         }
 
-        // Verifica sobreposicao com outros pedidos de horario.
+        if (date === today) {
+          const current = new Intl.DateTimeFormat("en-GB", {
+            timeZone: "America/Sao_Paulo",
+            hour: "2-digit",
+            minute: "2-digit",
+            hourCycle: "h23"
+          }).format(new Date());
+
+          if (requestedMinutes <= toMinutesSafe(current)) {
+            return Response.json({
+              error: "Esse horario ja passou. Escolha outro."
+            }, { status: 400 });
+          }
+        }
+
         const existing = await env.DB.prepare(`
           SELECT a.appointment_time, s.duration
           FROM appointments a
@@ -321,8 +479,8 @@ export default {
         `).bind(date).all();
 
         const conflict = existing.results.some(item => {
-          const parts = item.appointment_time.split(":").map(Number);
-          const oldStart = parts[0] * 60 + parts[1];
+          const [h, m] = item.appointment_time.split(":").map(Number);
+          const oldStart = h * 60 + m;
           const oldEnd = oldStart + Number(item.duration);
           const newEnd = requestedMinutes + Number(service.duration);
 
@@ -331,7 +489,7 @@ export default {
 
         if (conflict) {
           return Response.json({
-            error: "Esse horario ja esta ocupado ou solicitado. Escolha outro."
+            error: "Esse horario acabou de ser ocupado. Escolha outro."
           }, { status: 409 });
         }
 
@@ -350,7 +508,7 @@ export default {
 
         return Response.json({
           ok: true,
-          message: "Solicitacao registrada! O horario ainda precisa ser confirmado pela profissional."
+          message: "Solicitacao registrada!"
         });
       } catch (error) {
         return Response.json({
@@ -376,18 +534,29 @@ h1{color:#a34370;font-size:26px}
 p{line-height:1.5;color:#75656d}
 label{display:block;font-weight:bold;margin:16px 0 7px;font-size:14px}
 input,select{width:100%;padding:13px;border:1px solid #d9cbd1;border-radius:10px;font-size:16px;background:white;color:#35252c}
-button{width:100%;padding:14px;border:0;border-radius:10px;background:var(--accent,#a34370);color:white;font-size:16px;font-weight:bold;margin-top:20px}
-button:disabled{opacity:.6}
-#status{overflow-wrap:anywhere}
+button{cursor:pointer}
+.submit{width:100%;padding:14px;border:0;border-radius:10px;background:var(--accent,#a34370);color:white;font-size:16px;font-weight:bold;margin-top:20px}
+button:disabled{opacity:.5;cursor:not-allowed}
 .brand{font-size:13px;color:#a34370;font-weight:bold}
+#status{overflow-wrap:anywhere}
+.slots{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px;margin-top:10px}
+.slot{border:1px solid #d9cbd1;background:white;color:#35252c;border-radius:10px;padding:13px 4px;font-size:15px;font-weight:bold}
+.slot.selected{background:var(--accent,#a34370);color:white;border-color:var(--accent,#a34370)}
+.slot:disabled{opacity:.4}
+.help{font-size:13px}
+.hidden{display:none!important}
+.success{text-align:center;padding:12px 0}
+.check{font-size:46px;color:#32845b}
+.secondary{display:block;text-align:center;text-decoration:none;background:#f8eaf0;color:#84365c;padding:14px;border-radius:10px;font-weight:bold;margin-top:12px}
 </style>
 </head>
 <body>
 <main>
-<div class="card">
+<div class="card" id="bookingCard">
 <div class="brand">AGENDA BEAUTY</div>
 <h1 id="businessName">Agendamento</h1>
 <p id="businessCategory">Escolha o servico e o horario desejado.</p>
+
 <form id="bookingForm">
 <label for="service">Servico</label>
 <select id="service" required>
@@ -397,8 +566,10 @@ button:disabled{opacity:.6}
 <label for="date">Data desejada</label>
 <input id="date" type="date" required>
 
-<label for="time">Horario desejado</label>
-<input id="time" type="time" required>
+<label>Horarios disponiveis</label>
+<p class="help" id="slotHelp">Escolha primeiro o servico e a data.</p>
+<div class="slots" id="slots"></div>
+<input id="time" type="hidden" required>
 
 <label for="customer">Seu nome</label>
 <input id="customer" maxlength="100" required placeholder="Digite seu nome">
@@ -406,14 +577,28 @@ button:disabled{opacity:.6}
 <label for="phone">Seu WhatsApp com DDD</label>
 <input id="phone" maxlength="25" required type="tel" placeholder="Ex.: 21999999999">
 
-<button id="send" type="submit">Solicitar agendamento</button>
+<button class="submit" id="send" type="submit">Solicitar agendamento</button>
 <p id="status" role="status"></p>
 </form>
 </div>
+
+<div class="card hidden" id="successCard">
+<div class="success">
+<div class="check">✓</div>
+<h1>Solicitacao enviada!</h1>
+<p id="successMessage">Seu pedido foi registrado.</p>
+<p>Seu horario ainda precisa ser confirmado pela profissional.</p>
+</div>
+<a class="secondary" href="/agendar">Fazer outro agendamento</a>
+<a class="secondary" href="/">Voltar para a pagina inicial</a>
+</div>
 </main>
+
 <script>
 const $ = id => document.getElementById(id);
 const dateInput = $("date");
+let selectedTime = "";
+let businessAccent = "#a34370";
 
 const localToday = () => new Intl.DateTimeFormat("en-CA", {
   timeZone: "America/Sao_Paulo",
@@ -424,6 +609,72 @@ const localToday = () => new Intl.DateTimeFormat("en-CA", {
 
 dateInput.min = localToday();
 
+function clearSlots(message) {
+  selectedTime = "";
+  $("time").value = "";
+  $("slots").replaceChildren();
+  $("slotHelp").textContent = message;
+}
+
+function showSlots(slots) {
+  $("slots").replaceChildren();
+  selectedTime = "";
+  $("time").value = "";
+
+  if (!slots.length) {
+    $("slotHelp").textContent =
+      "Nao ha horarios disponiveis nessa data. Tente outro dia.";
+    return;
+  }
+
+  $("slotHelp").textContent = "Toque no horario que preferir:";
+
+  slots.forEach(time => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "slot";
+    button.textContent = time;
+    button.addEventListener("click", () => {
+      document.querySelectorAll(".slot").forEach(item => {
+        item.classList.remove("selected");
+      });
+
+      button.classList.add("selected");
+      selectedTime = time;
+      $("time").value = time;
+    });
+    $("slots").appendChild(button);
+  });
+}
+
+async function loadSlots() {
+  clearSlots("Consultando horarios disponiveis...");
+
+  if (!$("service").value || !dateInput.value) {
+    clearSlots("Escolha primeiro o servico e a data.");
+    return;
+  }
+
+  try {
+    const params = new URLSearchParams({
+      date: dateInput.value,
+      service_id: $("service").value
+    });
+
+    const response = await fetch("/api/availability?" + params);
+    const data = await response.json();
+
+    if (!response.ok) throw new Error(data.error || "Erro ao consultar.");
+
+    showSlots(data.slots || []);
+  } catch (error) {
+    clearSlots(error.message);
+  }
+}
+
+$("service").addEventListener("change", loadSlots);
+dateInput.addEventListener("change", loadSlots);
+
 fetch("/api/public-config")
   .then(async response => {
     const data = await response.json();
@@ -431,10 +682,8 @@ fetch("/api/public-config")
 
     $("businessName").textContent = data.professional.name;
     $("businessCategory").textContent = data.professional.category;
-    document.documentElement.style.setProperty(
-      "--accent",
-      data.professional.accent_color || "#a34370"
-    );
+    businessAccent = data.professional.accent_color || "#a34370";
+    document.documentElement.style.setProperty("--accent", businessAccent);
 
     $("service").innerHTML =
       '<option value="">Selecione um servico</option>';
@@ -462,6 +711,11 @@ fetch("/api/public-config")
 $("bookingForm").addEventListener("submit", async event => {
   event.preventDefault();
 
+  if (!selectedTime) {
+    $("status").textContent = "Escolha um horario disponivel na grade.";
+    return;
+  }
+
   const button = $("send");
   button.disabled = true;
   $("status").textContent = "Enviando solicitacao...";
@@ -472,8 +726,8 @@ $("bookingForm").addEventListener("submit", async event => {
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({
         service_id: $("service").value,
-        date: $("date").value,
-        time: $("time").value,
+        date: dateInput.value,
+        time: selectedTime,
         customer_name: $("customer").value.trim(),
         customer_phone: $("phone").value.trim()
       })
@@ -482,11 +736,18 @@ $("bookingForm").addEventListener("submit", async event => {
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || "Nao foi possivel enviar.");
 
-    $("status").textContent = result.message;
-    $("bookingForm").reset();
-    dateInput.min = localToday();
+    const serviceName = $("service").selectedOptions[0].textContent;
+    $("successMessage").textContent =
+      "Seu pedido para " + serviceName + ", no dia " +
+      dateInput.value.split("-").reverse().join("/") +
+      " as " + selectedTime + ", foi registrado.";
+
+    $("bookingCard").classList.add("hidden");
+    $("successCard").classList.remove("hidden");
+    window.scrollTo(0, 0);
   } catch (error) {
     $("status").textContent = error.message;
+    await loadSlots();
   } finally {
     button.disabled = false;
   }
@@ -555,7 +816,6 @@ button{border:0;border-radius:10px;padding:13px 16px;font-weight:bold;font-size:
 <section class="card">
 <h2>Seus servicos</h2>
 <p>Adicione os procedimentos, precos e duracao.</p>
-
 <label for="serviceName">Nome do servico</label>
 <input id="serviceName" placeholder="Ex.: Manicure">
 
@@ -591,12 +851,12 @@ button{border:0;border-radius:10px;padding:13px 16px;font-weight:bold;font-size:
 <input id="end" type="time" value="18:00">
 </div>
 </div>
+<p class="small">Os horarios para as clientes serao exibidos em intervalos de 30 minutos, respeitando a duracao do servico e os agendamentos existentes.</p>
 </section>
 
 <section class="card">
 <h2>Previa da sua pagina</h2>
 <p class="small">Exemplo de como suas clientes poderao visualizar os servicos.</p>
-
 <div class="preview" id="preview">
 <h3 id="previewName">Seu espaco de beleza</h3>
 <span class="pill" id="previewCategory">Unhas</span>
@@ -628,8 +888,8 @@ function renderServices() {
     return;
   }
 
-  list.innerHTML = "";
-  preview.innerHTML = "";
+  list.replaceChildren();
+  preview.replaceChildren();
 
   services.forEach((service, index) => {
     const item = document.createElement("div");
@@ -791,6 +1051,11 @@ async function loadConfig() {
   } catch (error) {
     $("status").textContent = "Erro ao carregar os dados: " + error.message;
   }
+}
+
+function toMinutesSafe(value) {
+  const [hours, minutes] = value.split(":").map(Number);
+  return hours * 60 + minutes;
 }
 
 updatePreview();

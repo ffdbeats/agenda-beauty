@@ -2,5 +2,12 @@
 {
   "name": "agenda-beauty",
   "main": "src/index.js",
-  "compatibility_date": "2026-10-19"
+  "compatibility_date": "2026-10-19",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "agenda-beauty-db",
+      "database_id": "b654d405-6a1b-4d94-bcaa-89654341689b"
+    }
+  ]
 }

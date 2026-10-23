@@ -1,470 +1,287 @@
+// Agenda Beauty — versão de teste com login e sessão.
+// IMPORTANTE: configure os segredos SESSION_SECRET e SETUP_SECRET no Cloudflare antes de usar.
+// Esta versão preserva o fluxo atual de uma única profissional (salon_id=1).
+// Não é ainda uma versão multi-salão pronta para vender.
+
+const encoder = new TextEncoder();
+const json = (data, status = 200, headers = {}) =>
+  Response.json(data, { status, headers });
+const html = (body, status = 200, headers = {}) =>
+  new Response(body, { status, headers: { "Content-Type": "text/html; charset=UTF-8", ...headers } });
+const b64url = bytes => btoa(String.fromCharCode(...new Uint8Array(bytes)))
+  .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+const fromB64url = value => Uint8Array.from(
+  atob(value.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - value.length % 4) % 4)),
+  c => c.charCodeAt(0)
+);
+const randomToken = (n = 32) => {
+  const bytes = crypto.getRandomValues(new Uint8Array(n));
+  return b64url(bytes);
+};
+async function hmac(secret, value) {
+  const key = await crypto.subtle.importKey("raw", encoder.encode(secret),
+    { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  return b64url(await crypto.subtle.sign("HMAC", key, encoder.encode(value)));
+}
+async function passwordHash(password, salt) {
+  const key = await crypto.subtle.importKey("raw", encoder.encode(password), "PBKDF2", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits({
+    name: "PBKDF2", salt: encoder.encode(salt), iterations: 210000, hash: "SHA-256"
+  }, key, 256);
+  return "pbkdf2$210000$" + salt + "$" + b64url(bits);
+}
+async function passwordMatches(password, stored) {
+  try {
+    const [kind, rounds, salt, expected] = stored.split("$");
+    if (kind !== "pbkdf2" || Number(rounds) !== 210000 || !salt || !expected) return false;
+    const actual = await passwordHash(password, salt);
+    return actual === stored;
+  } catch { return false; }
+}
+function cookieValue(request, name) {
+  const cookie = request.headers.get("Cookie") || "";
+  const found = cookie.split(";").map(v => v.trim()).find(v => v.startsWith(name + "="));
+  return found ? decodeURIComponent(found.slice(name.length + 1)) : "";
+}
+async function createSession(env, user) {
+  const payload = b64url(encoder.encode(JSON.stringify({
+    uid: user.id, salon_id: user.salon_id, role: user.role, exp: Math.floor(Date.now()/1000) + 60*60*24*7
+  })));
+  return payload + "." + await hmac(env.SESSION_SECRET, payload);
+}
+async function readSession(request, env) {
+  if (!env.SESSION_SECRET) return null;
+  const token = cookieValue(request, "agenda_session");
+  const parts = token.split(".");
+  if (parts.length !== 2) return null;
+  const expected = await hmac(env.SESSION_SECRET, parts[0]);
+  if (expected !== parts[1]) return null;
+  try {
+    const data = JSON.parse(new TextDecoder().decode(fromB64url(parts[0])));
+    if (!data.uid || !data.salon_id || !data.exp || data.exp < Math.floor(Date.now()/1000)) return null;
+    const user = await env.DB.prepare(
+      "SELECT id, salon_id, email, role, status FROM users WHERE id = ? AND salon_id = ?"
+    ).bind(data.uid, data.salon_id).first();
+    if (!user || user.status !== "active" || user.role !== data.role) return null;
+    return user;
+  } catch { return null; }
+}
+const sessionCookie = token =>
+  "agenda_session=" + encodeURIComponent(token) + "; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=604800";
+const clearCookie = "agenda_session=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0";
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    const json = (data, status = 200) =>
-      Response.json(data, { status });
-    const toMinutes = value => {
-      const [h, m] = String(value || "00:00").split(":").map(Number);
-      return h * 60 + m;
+    const method = request.method;
+    if (!env.DB) return new Response("Banco D1 ainda não está conectado ao Worker.", { status: 500 });
+    const minutes = value => { const [h,m] = String(value || "00:00").split(":").map(Number); return h*60+m; };
+    const fmt = n => String(Math.floor(n/60)).padStart(2,"0")+":"+String(n%60).padStart(2,"0");
+    const validTime = v => /^\d{2}:\d{2}$/.test(String(v)) && Number(v.slice(0,2)) <= 23 && Number(v.slice(3,5)) <= 59;
+    const today = () => new Intl.DateTimeFormat("en-CA",{timeZone:"America/Sao_Paulo",year:"numeric",month:"2-digit",day:"2-digit"}).format(new Date());
+    const nowMinutes = () => minutes(new Intl.DateTimeFormat("en-GB",{timeZone:"America/Sao_Paulo",hour:"2-digit",minute:"2-digit",hourCycle:"h23"}).format(new Date()));
+    const daysSet = days => {
+      if (String(days||"").startsWith("Personalizado:")) return new Set(String(days).slice(14).split(",").map(Number).filter(n=>Number.isInteger(n)&&n>=0&&n<=6));
+      if (days==="Todos os dias") return new Set([0,1,2,3,4,5,6]);
+      if (days==="Segunda a sábado") return new Set([1,2,3,4,5,6]);
+      return new Set([1,2,3,4,5]);
     };
-    const formatTime = minutes =>
-      String(Math.floor(minutes / 60)).padStart(2, "0") + ":" +
-      String(minutes % 60).padStart(2, "0");
-    const validTime = value => {
-      if (!/^\d{2}:\d{2}$/.test(String(value))) return false;
-      const [h, m] = value.split(":").map(Number);
-      return h >= 0 && h <= 23 && m >= 0 && m <= 59;
-    };
-    const localToday = () => new Intl.DateTimeFormat("en-CA", {
-      timeZone: "America/Sao_Paulo", year: "numeric",
-      month: "2-digit", day: "2-digit"
-    }).format(new Date());
-    const currentMinutes = () => toMinutes(new Intl.DateTimeFormat("en-GB", {
-      timeZone: "America/Sao_Paulo", hour: "2-digit",
-      minute: "2-digit", hourCycle: "h23"
-    }).format(new Date()));
-    const dayIsClosed = (days, weekday) =>
-      (days === "Segunda a sexta" && (weekday === 0 || weekday === 6)) ||
-      (days === "Segunda a sábado" && weekday === 0);
+    const session = await readSession(request, env);
 
-    if (!env.DB) {
-      return new Response("Banco D1 ainda não está conectado ao Worker.", { status: 500 });
+    if (url.pathname === "/login" && method === "GET") {
+      return html(`<!doctype html><html lang="pt-BR"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Entrar — Agenda Beauty</title>
+      <style>body{font-family:Arial;background:#fff8f7;color:#35252c;padding:20px}main{max-width:420px;margin:8vh auto;background:white;border:1px solid #eadde2;border-radius:16px;padding:22px}h1{color:#a34370}label{display:block;margin:15px 0 6px;font-weight:bold}input{width:100%;box-sizing:border-box;padding:13px;border:1px solid #d9cbd1;border-radius:9px;font-size:16px}button{margin-top:18px;width:100%;padding:14px;background:#a34370;color:white;border:0;border-radius:9px;font-weight:bold;font-size:16px}p{line-height:1.5;color:#75656d}</style>
+      <main><h1>Agenda Beauty</h1><p>Entre para configurar sua agenda.</p><form id="f"><label>E-mail</label><input id="email" type="email" autocomplete="username" required><label>Senha</label><input id="password" type="password" autocomplete="current-password" required><button>Entrar</button><p id="msg" role="status"></p></form></main>
+      <script>f.onsubmit=async e=>{e.preventDefault();msg.textContent="Verificando...";try{let r=await fetch("/api/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({email:email.value,password:password.value})});let d=await r.json();if(!r.ok)throw Error(d.error||"Não foi possível entrar");location.href="/"}catch(e){msg.textContent=e.message}}</script></html>`);
     }
-
-    if (url.pathname === "/api/config" && request.method === "GET") {
+    if (url.pathname === "/configurar-acesso" && method === "GET") {
+      const count = await env.DB.prepare("SELECT COUNT(*) AS n FROM users").first();
+      if (Number(count?.n || 0) > 0) return html("<h1>Configuração inicial já encerrada.</h1>", 410);
+      return html(`<!doctype html><html lang="pt-BR"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Criar acesso</title><style>body{font-family:Arial;background:#fff8f7;padding:20px;color:#35252c}main{max-width:440px;margin:auto;background:white;padding:22px;border-radius:15px}label{display:block;margin:14px 0 6px;font-weight:bold}input{width:100%;box-sizing:border-box;padding:12px;border:1px solid #d9cbd1;border-radius:8px;font-size:16px}button{margin-top:18px;padding:13px;background:#a34370;color:white;border:0;border-radius:8px;width:100%;font-weight:bold}</style><main><h1>Criar primeiro acesso</h1><p>Esta página só funciona enquanto ainda não existe nenhum usuário.</p><form id="f"><label>Chave de configuração (SETUP_SECRET)</label><input id="setupSecret" type="password" required><label>Seu e-mail</label><input id="email" type="email" required><label>Crie uma senha (mínimo 12 caracteres)</label><input id="password" type="password" minlength="12" required><button>Criar acesso</button><p id="msg"></p></form></main><script>f.onsubmit=async e=>{e.preventDefault();msg.textContent="Criando acesso...";try{let r=await fetch("/api/setup-owner",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({setupSecret:setupSecret.value,email:email.value,password:password.value})});let d=await r.json();if(!r.ok)throw Error(d.error||"Falha");location.href="/login"}catch(e){msg.textContent=e.message}}</script></html>`);
+    }
+    if (url.pathname === "/api/setup-owner" && method === "POST") {
+      if (!env.SETUP_SECRET || !env.SESSION_SECRET) return json({error:"Configure os segredos SETUP_SECRET e SESSION_SECRET no Cloudflare."},500);
+      let data; try { data = await request.json(); } catch { return json({error:"Dados inválidos."},400); }
+      if (typeof data.setupSecret !== "string" || data.setupSecret !== env.SETUP_SECRET) return json({error:"Chave de configuração incorreta."},403);
+      const count = await env.DB.prepare("SELECT COUNT(*) AS n FROM users").first();
+      if (Number(count?.n || 0) !== 0) return json({error:"O primeiro acesso já foi criado. Esta etapa está encerrada."},409);
+      const email = String(data.email||"").trim().toLowerCase();
+      const password = String(data.password||"");
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || password.length < 12 || password.length > 200)
+        return json({error:"Informe um e-mail válido e uma senha de 12 a 200 caracteres."},400);
+      const salon = await env.DB.prepare("SELECT id FROM salons WHERE id = 1 AND status = 'active'").first();
+      if (!salon) return json({error:"Não encontrei o salão de teste ativo (ID 1)."},500);
+      const hash = await passwordHash(password, randomToken(16));
       try {
-        const professional = await env.DB.prepare(
-          "SELECT * FROM professionals WHERE id = 1"
-        ).first();
-        if (!professional) return json({ configured: false });
-        const result = await env.DB.prepare(`
-          SELECT name, price, duration FROM services
-          WHERE professional_id = 1 AND name NOT LIKE '[Arquivado] %'
-          ORDER BY id
-        `).all();
-        return json({ configured: true, professional, services: result.results });
-      } catch {
-        return json({ error: "Não foi possível carregar os dados." }, 500);
-      }
+        await env.DB.prepare("INSERT INTO users (salon_id,email,password_hash,role,status) VALUES (1,?,?, 'salon_owner','active')")
+          .bind(email, hash).run();
+      } catch { return json({error:"Não foi possível criar o usuário. Confira se o e-mail já existe."},400); }
+      return json({ok:true,message:"Acesso criado. Agora entre pela página de login."});
     }
+    if (url.pathname === "/api/login" && method === "POST") {
+      if (!env.SESSION_SECRET) return json({error:"O segredo SESSION_SECRET ainda não foi configurado no Cloudflare."},500);
+      let data; try { data = await request.json(); } catch { return json({error:"Dados inválidos."},400); }
+      const email = String(data.email||"").trim().toLowerCase();
+      const password = String(data.password||"");
+      if (!email || !password || email.length > 254 || password.length > 200) return json({error:"Confira o e-mail e a senha."},400);
+      const user = await env.DB.prepare("SELECT id,salon_id,email,password_hash,role,status FROM users WHERE email = ?").bind(email).first();
+      if (!user || user.status !== "active" || !await passwordMatches(password,user.password_hash))
+        return json({error:"E-mail ou senha incorretos."},401);
+      if (user.role !== "salon_owner" && user.role !== "platform_admin") return json({error:"Este usuário não tem permissão para acessar esta área."},403);
+      const token = await createSession(env,user);
+      return json({ok:true},200,{"Set-Cookie":sessionCookie(token),"Cache-Control":"no-store"});
+    }
+    if (url.pathname === "/sair") return new Response(null,{status:302,headers:{"Location":"/login","Set-Cookie":clearCookie,"Cache-Control":"no-store"}});
+    if (url.pathname === "/api/logout" && method === "POST") return json({ok:true},200,{"Set-Cookie":clearCookie,"Cache-Control":"no-store"});
 
-    if (url.pathname === "/api/config" && request.method === "POST") {
+    const privateApi = url.pathname === "/api/config" || url.pathname === "/api/appointments";
+    if (privateApi && !session) {
+      if (url.pathname === "/api/appointments" && method === "POST") { /* agendamento público */ }
+      else return json({error:"Faça login para acessar esta área."},401);
+    }
+    if (url.pathname === "/" && !session) return new Response(null,{status:302,headers:{Location:"/login","Cache-Control":"no-store"}});
+    if (url.pathname === "/" && session && session.role !== "salon_owner" && session.role !== "platform_admin")
+      return new Response("Acesso negado.",{status:403});
+
+    if (url.pathname === "/api/config" && method === "GET") {
+      try {
+        const professional = await env.DB.prepare("SELECT * FROM professionals WHERE salon_id = ? ORDER BY id LIMIT 1").bind(session.salon_id).first();
+        if (!professional) return json({configured:false});
+        const result = await env.DB.prepare("SELECT name,price,duration FROM services WHERE salon_id = ? AND professional_id = ? AND name NOT LIKE '[Arquivado] %' ORDER BY id")
+          .bind(session.salon_id,professional.id).all();
+        return json({configured:true,professional,services:result.results});
+      } catch { return json({error:"Não foi possível carregar os dados."},500); }
+    }
+    if (url.pathname === "/api/config" && method === "POST") {
       try {
         const data = await request.json();
-        const name = String(data.name || "").trim();
-        const category = String(data.category || "").trim();
+        const name = String(data.name||"").trim(), category = String(data.category||"").trim();
         const accent = /^#[0-9a-fA-F]{6}$/.test(data.accent) ? data.accent : "#a34370";
-        const days = String(data.days || "Segunda a sexta");
-        const start = String(data.start || "09:00");
-        const end = String(data.end || "18:00");
-        const prepMinutes = Number(data.prep_minutes ?? 10);
-        const services = data.services;
-
-        if (!name || !category || !Array.isArray(services)) {
-          return json({ error: "Confira o nome, a categoria e os serviços." }, 400);
+        const days = String(data.days||"Segunda a sexta"), start = String(data.start||"09:00"), end = String(data.end||"18:00");
+        const prep = Number(data.prep_minutes ?? 10), services = data.services;
+        if (!name || name.length>120 || !category || category.length>100 || !Array.isArray(services)) return json({error:"Confira o nome, a categoria e os serviços."},400);
+        if (services.length>100) return json({error:"Limite de 100 serviços."},400);
+        if (!validTime(start)||!validTime(end)||minutes(start)>=minutes(end)) return json({error:"Confira os horários de atendimento."},400);
+        if (!Number.isInteger(prep)||prep<0||prep>180) return json({error:"Preparação deve ser de 0 a 180 minutos."},400);
+        const names = new Set();
+        for (const s of services) {
+          const n=String(s.name||"").trim();
+          if (!n||n.length>120||n.startsWith("[Arquivado] ")||names.has(n.toLowerCase())||!Number.isFinite(Number(s.price))||Number(s.price)<0||!Number.isInteger(Number(s.duration))||Number(s.duration)<1||Number(s.duration)>1440)
+            return json({error:"Confira nomes, preços e durações dos serviços. Não repita nomes."},400);
+          names.add(n.toLowerCase());
         }
-        if (services.length > 100) {
-          return json({ error: "Limite de 100 serviços por configuração." }, 400);
+        let professional = await env.DB.prepare("SELECT id FROM professionals WHERE salon_id = ? ORDER BY id LIMIT 1").bind(session.salon_id).first();
+        if (professional) {
+          await env.DB.prepare("UPDATE professionals SET name=?,category=?,accent_color=?,work_days=?,start_time=?,end_time=?,prep_minutes=? WHERE id=? AND salon_id=?")
+            .bind(name,category,accent,days,start,end,prep,professional.id,session.salon_id).run();
+        } else {
+          await env.DB.prepare("INSERT INTO professionals (salon_id,name,category,accent_color,work_days,start_time,end_time,prep_minutes) VALUES (?,?,?,?,?,?,?,?)")
+            .bind(session.salon_id,name,category,accent,days,start,end,prep).run();
+          professional = await env.DB.prepare("SELECT id FROM professionals WHERE salon_id = ? ORDER BY id DESC LIMIT 1").bind(session.salon_id).first();
         }
-        if (!validTime(start) || !validTime(end) || toMinutes(start) >= toMinutes(end)) {
-          return json({ error: "Confira os horários de atendimento." }, 400);
-        }
-        if (!Number.isInteger(prepMinutes) || prepMinutes < 0 || prepMinutes > 180) {
-          return json({ error: "O tempo de preparação deve ser de 0 a 180 minutos." }, 400);
-        }
-
-        const serviceNames = new Set();
-        for (const service of services) {
-          const serviceName = String(service.name || "").trim();
-          if (!serviceName || serviceName.startsWith("[Arquivado] ") ||
-              serviceNames.has(serviceName.toLowerCase()) ||
-              !Number.isFinite(Number(service.price)) || Number(service.price) < 0 ||
-              !Number.isInteger(Number(service.duration)) ||
-              Number(service.duration) < 1 || Number(service.duration) > 1440) {
-            return json({ error: "Confira os nomes, preços e durações dos serviços. Não repita nomes." }, 400);
-          }
-          serviceNames.add(serviceName.toLowerCase());
-        }
-
-        await env.DB.prepare(`
-          INSERT INTO professionals
-            (id, name, category, accent_color, work_days, start_time, end_time, prep_minutes)
-          VALUES (1, ?, ?, ?, ?, ?, ?, ?)
-          ON CONFLICT(id) DO UPDATE SET
-            name = excluded.name, category = excluded.category,
-            accent_color = excluded.accent_color, work_days = excluded.work_days,
-            start_time = excluded.start_time, end_time = excluded.end_time,
-            prep_minutes = excluded.prep_minutes
-        `).bind(name, category, accent, days, start, end, prepMinutes).run();
-
-        const existingResult = await env.DB.prepare(
-          "SELECT id, name FROM services WHERE professional_id = 1"
-        ).all();
-        const existing = existingResult.results;
-        const usedIds = new Set();
-
-        for (const service of services) {
-          const serviceName = String(service.name).trim();
-          const match = existing.find(item => item.name === serviceName && !usedIds.has(item.id));
+        const pid = professional.id;
+        const existing = (await env.DB.prepare("SELECT id,name FROM services WHERE salon_id=? AND professional_id=?").bind(session.salon_id,pid).all()).results;
+        const used = new Set();
+        for (const s of services) {
+          const n=String(s.name).trim(), match=existing.find(x=>x.name===n&&!used.has(x.id));
           if (match) {
-            usedIds.add(match.id);
-            await env.DB.prepare(`
-              UPDATE services SET price = ?, duration = ?
-              WHERE id = ? AND professional_id = 1
-            `).bind(Number(service.price), Number(service.duration), match.id).run();
+            used.add(match.id);
+            await env.DB.prepare("UPDATE services SET price=?,duration=? WHERE id=? AND salon_id=? AND professional_id=?")
+              .bind(Number(s.price),Number(s.duration),match.id,session.salon_id,pid).run();
           } else {
-            await env.DB.prepare(`
-              INSERT INTO services (professional_id, name, price, duration)
-              VALUES (1, ?, ?, ?)
-            `).bind(serviceName, Number(service.price), Number(service.duration)).run();
+            await env.DB.prepare("INSERT INTO services (salon_id,professional_id,name,price,duration) VALUES (?,?,?,?,?)")
+              .bind(session.salon_id,pid,n,Number(s.price),Number(s.duration)).run();
           }
         }
-
         for (const item of existing) {
-          if (usedIds.has(item.id)) continue;
-          const bookings = await env.DB.prepare(
-            "SELECT id FROM appointments WHERE service_id = ? LIMIT 1"
-          ).bind(item.id).first();
-          if (bookings) {
-            if (!item.name.startsWith("[Arquivado] ")) {
-              await env.DB.prepare("UPDATE services SET name = ? WHERE id = ?")
-                .bind("[Arquivado] " + item.name, item.id).run();
-            }
-          } else {
-            await env.DB.prepare("DELETE FROM services WHERE id = ?").bind(item.id).run();
-          }
+          if (used.has(item.id)) continue;
+          const booked = await env.DB.prepare("SELECT id FROM appointments WHERE salon_id=? AND service_id=? LIMIT 1").bind(session.salon_id,item.id).first();
+          if (booked) {
+            if (!item.name.startsWith("[Arquivado] ")) await env.DB.prepare("UPDATE services SET name=? WHERE id=? AND salon_id=?").bind("[Arquivado] "+item.name,item.id,session.salon_id).run();
+          } else await env.DB.prepare("DELETE FROM services WHERE id=? AND salon_id=?").bind(item.id,session.salon_id).run();
         }
-        return json({ ok: true, message: "Configuração salva!" });
-      } catch (error) {
-        return json({ error: "Erro ao salvar. Confira se a coluna prep_minutes existe no D1 e se a conexão está ativa." }, 500);
-      }
+        return json({ok:true,message:"Configuração salva!"});
+      } catch { return json({error:"Erro ao salvar. Confira as colunas do banco e tente novamente."},500); }
     }
 
-    if (url.pathname === "/api/public-config" && request.method === "GET") {
+    if (url.pathname === "/api/public-config" && method === "GET") {
       try {
-        const professional = await env.DB.prepare(`
-          SELECT name, category, accent_color, work_days, start_time, end_time, prep_minutes
-          FROM professionals WHERE id = 1
-        `).first();
-        if (!professional) return json({ error: "Este espaço ainda não foi configurado." }, 404);
-        const result = await env.DB.prepare(`
-          SELECT id, name, price, duration FROM services
-          WHERE professional_id = 1 AND name NOT LIKE '[Arquivado] %'
-          ORDER BY id
-        `).all();
-        return json({ professional, services: result.results });
-      } catch {
-        return json({ error: "Não foi possível carregar os serviços." }, 500);
-      }
+        const p = await env.DB.prepare("SELECT name,category,accent_color,work_days,start_time,end_time,prep_minutes FROM professionals WHERE salon_id=1 ORDER BY id LIMIT 1").first();
+        if (!p) return json({error:"Este espaço ainda não foi configurado."},404);
+        const professional = await env.DB.prepare("SELECT id FROM professionals WHERE salon_id=1 ORDER BY id LIMIT 1").first();
+        const services = await env.DB.prepare("SELECT id,name,price,duration FROM services WHERE salon_id=1 AND professional_id=? AND name NOT LIKE '[Arquivado] %' ORDER BY id").bind(professional.id).all();
+        return json({professional:p,services:services.results});
+      } catch { return json({error:"Não foi possível carregar os serviços."},500); }
     }
-
-    if (url.pathname === "/api/availability" && request.method === "GET") {
+    if (url.pathname === "/api/availability" && method === "GET") {
       try {
-        const date = url.searchParams.get("date") || "";
-        const serviceId = Number(url.searchParams.get("service_id"));
-        if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !Number.isInteger(serviceId)) {
-          return json({ error: "Escolha a data e o serviço." }, 400);
-        }
-        const selectedDate = new Date(date + "T12:00:00Z");
-        if (Number.isNaN(selectedDate.getTime()) || selectedDate.toISOString().slice(0, 10) !== date) {
-          return json({ error: "Data inválida." }, 400);
-        }
-        const today = localToday();
-        if (date < today) return json({ slots: [] });
-
-        const professional = await env.DB.prepare(
-          "SELECT * FROM professionals WHERE id = 1"
-        ).first();
-        const service = await env.DB.prepare(`
-          SELECT id, duration FROM services
-          WHERE id = ? AND professional_id = 1 AND name NOT LIKE '[Arquivado] %'
-        `).bind(serviceId).first();
-        if (!professional || !service) return json({ error: "Profissional ou serviço não encontrado." }, 404);
-
-        const weekday = selectedDate.getUTCDay();
-        const days = professional.work_days || "Segunda a sexta";
-        if (dayIsClosed(days, weekday)) return json({ slots: [] });
-
-        const opening = toMinutes(professional.start_time);
-        const closing = toMinutes(professional.end_time);
-        const duration = Number(service.duration);
-        const prep = Number(professional.prep_minutes ?? 10);
-        const result = await env.DB.prepare(`
-          SELECT a.appointment_time, s.duration
-          FROM appointments a JOIN services s ON s.id = a.service_id
-          WHERE a.professional_id = 1 AND a.appointment_date = ?
-            AND a.status != 'cancelled'
-        `).bind(date).all();
-
-        const occupied = result.results.map(item => {
-          const start = toMinutes(item.appointment_time);
-          return { start, end: start + Number(item.duration) + prep };
-        });
-
-        // Grade original de 30 minutos, mais horários exatos após serviço + preparação.
-        const candidates = new Set();
-        for (let start = opening; start + duration <= closing; start += 30) {
-          candidates.add(start);
-        }
-        for (const item of occupied) {
-          const next = item.end;
-          if (next >= opening && next + duration <= closing) candidates.add(next);
-        }
-
-        let slots = [...candidates]
-          .filter(start => start >= opening && start + duration <= closing)
-          .filter(start => !occupied.some(item =>
-            start < item.end && start + duration > item.start
-          ))
-          .sort((a, b) => a - b)
-          .map(formatTime);
-
-        if (date === today) {
-          const now = currentMinutes();
-          slots = slots.filter(slot => toMinutes(slot) > now);
-        }
-        return json({ slots });
-      } catch {
-        return json({ error: "Não foi possível consultar os horários." }, 500);
-      }
+        const date=url.searchParams.get("date")||"", sid=Number(url.searchParams.get("service_id"));
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(date)||!Number.isInteger(sid)) return json({error:"Escolha a data e o serviço."},400);
+        const dt=new Date(date+"T12:00:00Z"); if(Number.isNaN(dt.getTime())||dt.toISOString().slice(0,10)!==date) return json({error:"Data inválida."},400);
+        if(date<today()) return json({slots:[]});
+        const p=await env.DB.prepare("SELECT * FROM professionals WHERE salon_id=1 ORDER BY id LIMIT 1").first();
+        const s=await env.DB.prepare("SELECT id,duration FROM services WHERE id=? AND salon_id=1 AND name NOT LIKE '[Arquivado] %'").bind(sid).first();
+        if(!p||!s) return json({error:"Profissional ou serviço não encontrado."},404);
+        if(!daysSet(p.work_days).has(dt.getUTCDay())) return json({slots:[]});
+        const opening=minutes(p.start_time),closing=minutes(p.end_time),duration=Number(s.duration),prep=Number(p.prep_minutes??10);
+        const rows=await env.DB.prepare("SELECT a.appointment_time,s.duration FROM appointments a JOIN services s ON s.id=a.service_id AND s.salon_id=a.salon_id WHERE a.salon_id=1 AND a.professional_id=? AND a.appointment_date=? AND (a.status IS NULL OR a.status!='cancelled')").bind(p.id,date).all();
+        const occupied=rows.results.map(x=>({start:minutes(x.appointment_time),end:minutes(x.appointment_time)+Number(x.duration)+prep}));
+        const candidates=new Set(); for(let t=opening;t+duration<=closing;t+=30)candidates.add(t);
+        for(const x of occupied)if(x.end>=opening&&x.end+duration<=closing)candidates.add(x.end);
+        let slots=[...candidates].filter(t=>t>=opening&&t+duration<=closing&&!occupied.some(x=>t<x.end&&t+duration>x.start)).sort((a,b)=>a-b).map(fmt);
+        if(date===today())slots=slots.filter(t=>minutes(t)>nowMinutes());
+        return json({slots});
+      } catch { return json({error:"Não foi possível consultar os horários."},500); }
     }
-
-    if (url.pathname === "/api/appointments" && request.method === "POST") {
+    if (url.pathname === "/api/appointments" && method === "POST") {
       try {
-        const data = await request.json();
-        const serviceId = Number(data.service_id);
-        const customerName = String(data.customer_name || "").trim();
-        const customerPhone = String(data.customer_phone || "").trim();
-        const date = String(data.date || "");
-        const time = String(data.time || "");
-
-        if (!customerName || customerName.length > 100 || !customerPhone ||
-            customerPhone.length > 25 || !Number.isInteger(serviceId) ||
-            !/^\d{4}-\d{2}-\d{2}$/.test(date) || !validTime(time)) {
-          return json({ error: "Preencha todos os campos corretamente." }, 400);
-        }
-        const selectedDate = new Date(date + "T12:00:00Z");
-        if (Number.isNaN(selectedDate.getTime()) || selectedDate.toISOString().slice(0, 10) !== date) {
-          return json({ error: "Escolha uma data válida." }, 400);
-        }
-        const today = localToday();
-        if (date < today) return json({ error: "Escolha hoje ou uma data futura." }, 400);
-
-        const professional = await env.DB.prepare(
-          "SELECT * FROM professionals WHERE id = 1"
-        ).first();
-        if (!professional) return json({ error: "O espaço ainda não foi configurado." }, 400);
-
-        const service = await env.DB.prepare(`
-          SELECT id, duration FROM services
-          WHERE id = ? AND professional_id = 1 AND name NOT LIKE '[Arquivado] %'
-        `).bind(serviceId).first();
-        if (!service) return json({ error: "Selecione um serviço válido." }, 400);
-
-        const requested = toMinutes(time);
-        const opening = toMinutes(professional.start_time);
-        const closing = toMinutes(professional.end_time);
-        const duration = Number(service.duration);
-        const prep = Number(professional.prep_minutes ?? 10);
-        if (requested < opening || requested + duration > closing) {
-          return json({ error: "Escolha um dos horários válidos." }, 400);
-        }
-
-        const weekday = selectedDate.getUTCDay();
-        const days = professional.work_days || "Segunda a sexta";
-        if (dayIsClosed(days, weekday)) {
-          return json({ error: "O espaço não atende nesse dia da semana." }, 400);
-        }
-        if (date === today && requested <= currentMinutes()) {
-          return json({ error: "Esse horário já passou. Escolha outro." }, 400);
-        }
-
-        const existing = await env.DB.prepare(`
-          SELECT a.appointment_time, s.duration
-          FROM appointments a JOIN services s ON s.id = a.service_id
-          WHERE a.professional_id = 1 AND a.appointment_date = ?
-            AND a.status != 'cancelled'
-        `).bind(date).all();
-        const occupied = existing.results.map(item => {
-          const oldStart = toMinutes(item.appointment_time);
-          return { start: oldStart, end: oldStart + Number(item.duration) + prep };
-        });
-
-        // O servidor só aceita horários da grade ou o fim exato de serviço + preparação.
-        const candidates = new Set();
-        for (let start = opening; start + duration <= closing; start += 30) candidates.add(start);
-        for (const item of occupied) {
-          if (item.end >= opening && item.end + duration <= closing) candidates.add(item.end);
-        }
-        const validSlots = [...candidates].filter(start =>
-          start >= opening && start + duration <= closing &&
-          !occupied.some(item => start < item.end && start + duration > item.start)
-        );
-        if (!validSlots.includes(requested)) {
-          return json({ error: "Esse horário não está mais disponível. Escolha outro." }, 409);
-        }
-
-        await env.DB.prepare(`
-          INSERT INTO appointments
-            (professional_id, service_id, customer_name, customer_phone, appointment_date, appointment_time)
-          VALUES (1, ?, ?, ?, ?, ?)
-        `).bind(serviceId, customerName, customerPhone, date, time).run();
-
-        return json({ ok: true, message: "Solicitação registrada!" });
-      } catch {
-        return json({ error: "Não foi possível registrar a solicitação." }, 500);
-      }
+        const d=await request.json(),sid=Number(d.service_id),name=String(d.customer_name||"").trim(),phone=String(d.customer_phone||"").trim(),date=String(d.date||""),time=String(d.time||"");
+        if(!name||name.length>100||!phone||phone.length>25||!Number.isInteger(sid)||!/^\d{4}-\d{2}-\d{2}$/.test(date)||!validTime(time))return json({error:"Preencha todos os campos corretamente."},400);
+        const dt=new Date(date+"T12:00:00Z");if(Number.isNaN(dt.getTime())||dt.toISOString().slice(0,10)!==date||date<today())return json({error:"Escolha uma data válida, hoje ou futura."},400);
+        const p=await env.DB.prepare("SELECT * FROM professionals WHERE salon_id=1 ORDER BY id LIMIT 1").first();
+        const s=await env.DB.prepare("SELECT id,duration FROM services WHERE id=? AND salon_id=1 AND name NOT LIKE '[Arquivado] %'").bind(sid).first();
+        if(!p||!s)return json({error:"Selecione um serviço válido."},400);
+        const requested=minutes(time),opening=minutes(p.start_time),closing=minutes(p.end_time),duration=Number(s.duration),prep=Number(p.prep_minutes??10);
+        if(requested<opening||requested+duration>closing||!daysSet(p.work_days).has(dt.getUTCDay())||(date===today()&&requested<=nowMinutes()))return json({error:"Escolha um horário válido."},400);
+        const rows=await env.DB.prepare("SELECT a.appointment_time,s.duration FROM appointments a JOIN services s ON s.id=a.service_id AND s.salon_id=a.salon_id WHERE a.salon_id=1 AND a.professional_id=? AND a.appointment_date=? AND (a.status IS NULL OR a.status!='cancelled')").bind(p.id,date).all();
+        const occupied=rows.results.map(x=>({start:minutes(x.appointment_time),end:minutes(x.appointment_time)+Number(x.duration)+prep}));
+        const candidates=new Set();for(let t=opening;t+duration<=closing;t+=30)candidates.add(t);for(const x of occupied)if(x.end>=opening&&x.end+duration<=closing)candidates.add(x.end);
+        if(![...candidates].some(t=>t===requested&&t+duration<=closing&&!occupied.some(x=>t<x.end&&t+duration>x.start)))return json({error:"Esse horário não está mais disponível. Escolha outro."},409);
+        await env.DB.prepare("INSERT INTO appointments (salon_id,professional_id,service_id,customer_name,customer_phone,appointment_date,appointment_time) VALUES (1,?,?,?,?,?,?)")
+          .bind(p.id,sid,name,phone,date,time).run();
+        return json({ok:true,message:"Solicitação registrada!"});
+      } catch { return json({error:"Não foi possível registrar a solicitação."},500); }
     }
-
-    if (url.pathname === "/api/appointments" && request.method === "GET") {
+    if (url.pathname === "/api/appointments" && method === "GET") {
       try {
-        const today = localToday();
-        const result = await env.DB.prepare(`
-          SELECT a.id, a.customer_name, a.customer_phone, a.appointment_date,
-                 a.appointment_time, a.status, s.name AS service_name
-          FROM appointments a
-          JOIN services s ON s.id = a.service_id
-          WHERE a.professional_id = 1 AND a.appointment_date >= ?
-            AND (a.status IS NULL OR a.status != 'cancelled')
-          ORDER BY a.appointment_date, a.appointment_time
-          LIMIT 200
-        `).bind(today).all();
-        return json({ appointments: result.results });
-      } catch (error) {
-        return json({ error: "Não foi possível carregar os agendamentos." }, 500);
-      }
+        const p=await env.DB.prepare("SELECT id FROM professionals WHERE salon_id=? ORDER BY id LIMIT 1").bind(session.salon_id).first();
+        if(!p)return json({appointments:[]});
+        const rows=await env.DB.prepare("SELECT a.id,a.customer_name,a.customer_phone,a.appointment_date,a.appointment_time,a.status,s.name AS service_name FROM appointments a JOIN services s ON s.id=a.service_id AND s.salon_id=a.salon_id WHERE a.salon_id=? AND a.professional_id=? AND a.appointment_date>=? AND (a.status IS NULL OR a.status!='cancelled') ORDER BY a.appointment_date,a.appointment_time LIMIT 200")
+          .bind(session.salon_id,p.id,today()).all();
+        return json({appointments:rows.results});
+      } catch { return json({error:"Não foi possível carregar os agendamentos."},500); }
     }
-
-    if (url.pathname === "/agendar") {
-      const publicHtml = `<!DOCTYPE html>
-<html lang="pt-BR"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Agendar atendimento</title><style>
-*{box-sizing:border-box}body{margin:0;padding:20px 14px;background:#fff8f7;color:#35252c;font-family:Arial,sans-serif}
-main{max-width:520px;margin:auto}.card{background:white;border:1px solid #eadde2;border-radius:16px;padding:20px;margin:16px 0}
-h1{color:var(--accent,#a34370);font-size:26px}p{line-height:1.5;color:#75656d}label{display:block;font-weight:bold;margin:16px 0 7px;font-size:14px}
-input,select{width:100%;padding:13px;border:1px solid #d9cbd1;border-radius:10px;font-size:16px;background:white;color:#35252c}
-button{cursor:pointer}.submit{width:100%;padding:14px;border:0;border-radius:10px;background:var(--accent,#a34370);color:white;font-size:16px;font-weight:bold;margin-top:20px}
-button:disabled{opacity:.5}.brand{font-size:13px;color:var(--accent,#a34370);font-weight:bold}#status{overflow-wrap:anywhere}
-.slots{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px;margin-top:10px}
-.slot{border:1px solid #d9cbd1;background:white;color:#35252c;border-radius:10px;padding:13px 4px;font-size:15px;font-weight:bold}
-.slot.selected{background:var(--accent,#a34370);color:white;border-color:var(--accent,#a34370)}.help{font-size:13px}
-.hidden{display:none!important}.success{text-align:center;padding:12px 0}.check{font-size:46px;color:#32845b}
-.secondary{display:block;text-align:center;text-decoration:none;background:#f8eaf0;color:#84365c;padding:14px;border-radius:10px;font-weight:bold;margin-top:12px}
-</style></head><body><main>
-<div class="card" id="bookingCard"><div class="brand">AGENDA BEAUTY</div><h1 id="businessName">Agendamento</h1>
-<p id="businessCategory">Escolha o serviço e o horário desejado.</p><form id="bookingForm">
-<label for="service">Serviço</label><select id="service" required><option value="">Carregando serviços...</option></select>
-<label for="date">Data desejada</label><input id="date" type="date" required>
-<label>Horários disponíveis</label><p class="help" id="slotHelp">Escolha primeiro o serviço e a data.</p><div class="slots" id="slots"></div><input id="time" type="hidden" required>
-<label for="customer">Seu nome</label><input id="customer" maxlength="100" required placeholder="Digite seu nome">
-<label for="phone">Seu WhatsApp com DDD</label><input id="phone" maxlength="25" required type="tel" placeholder="Ex.: 21999999999">
-<button class="submit" id="send" type="submit">Solicitar agendamento</button><p id="status" role="status"></p></form></div>
-<div class="card hidden" id="successCard"><div class="success"><div class="check">✓</div><h1>Solicitação enviada!</h1>
-<p id="successMessage">Seu pedido foi registrado.</p><p>Seu horário ainda precisa ser confirmado pela profissional.</p></div>
-<a class="secondary" href="/agendar">Fazer outro agendamento</a></div>
-</main><script>
-const $=id=>document.getElementById(id);const dateInput=$("date");let selectedTime="";
-const localToday=()=>new Intl.DateTimeFormat("en-CA",{timeZone:"America/Sao_Paulo",year:"numeric",month:"2-digit",day:"2-digit"}).format(new Date());
-dateInput.min=localToday();
-function clearSlots(message){selectedTime="";$("time").value="";$("slots").replaceChildren();$("slotHelp").textContent=message;}
-function showSlots(slots){$("slots").replaceChildren();selectedTime="";$("time").value="";
-if(!slots.length){$("slotHelp").textContent="Não há horários disponíveis nessa data. Tente outro dia.";return;}
-$("slotHelp").textContent="Toque no horário que preferir:";
-slots.forEach(time=>{const button=document.createElement("button");button.type="button";button.className="slot";button.textContent=time;
-button.addEventListener("click",()=>{document.querySelectorAll(".slot").forEach(item=>item.classList.remove("selected"));button.classList.add("selected");selectedTime=time;$("time").value=time;});
-$("slots").appendChild(button);});}
-async function loadSlots(){clearSlots("Consultando horários disponíveis...");
-if(!$("service").value||!dateInput.value){clearSlots("Escolha primeiro o serviço e a data.");return;}
-try{const params=new URLSearchParams({date:dateInput.value,service_id:$("service").value});const response=await fetch("/api/availability?"+params);const data=await response.json();
-if(!response.ok)throw new Error(data.error||"Erro ao consultar.");showSlots(data.slots||[]);}catch(error){clearSlots(error.message);}}
-$("service").addEventListener("change",loadSlots);dateInput.addEventListener("change",loadSlots);
-fetch("/api/public-config").then(async response=>{const data=await response.json();if(!response.ok)throw new Error(data.error||"Erro ao carregar.");
-$("businessName").textContent=data.professional.name;$("businessCategory").textContent=data.professional.category;
-document.documentElement.style.setProperty("--accent",data.professional.accent_color||"#a34370");
-$("service").innerHTML='<option value="">Selecione um serviço</option>';
-data.services.forEach(service=>{const option=document.createElement("option");option.value=service.id;option.textContent=service.name+" - R$ "+Number(service.price).toFixed(2).replace(".",",")+" ("+service.duration+" min)";$("service").appendChild(option);});
-if(!data.services.length)$("status").textContent="Este espaço ainda não cadastrou serviços.";}).catch(error=>{$("service").innerHTML='<option value="">Serviços indisponíveis</option>';$("status").textContent=error.message;});
-$("bookingForm").addEventListener("submit",async event=>{event.preventDefault();if(!selectedTime){$("status").textContent="Escolha um horário disponível na grade.";return;}
-const button=$("send");button.disabled=true;$("status").textContent="Enviando solicitação...";
-try{const response=await fetch("/api/appointments",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({service_id:$("service").value,date:dateInput.value,time:selectedTime,customer_name:$("customer").value.trim(),customer_phone:$("phone").value.trim()})});
-const result=await response.json();if(!response.ok)throw new Error(result.error||"Não foi possível enviar.");
-const serviceName=$("service").selectedOptions[0].textContent;$("successMessage").textContent="Seu pedido para "+serviceName+", no dia "+dateInput.value.split("-").reverse().join("/")+" às "+selectedTime+", foi registrado.";
-$("bookingCard").classList.add("hidden");$("successCard").classList.remove("hidden");window.scrollTo(0,0);
-}catch(error){$("status").textContent=error.message;await loadSlots();}finally{button.disabled=false;}});
-</script></body></html>`;
-      return new Response(publicHtml, { headers: { "Content-Type": "text/html; charset=UTF-8" } });
+    if (url.pathname === "/agendar" && method === "GET") {
+      return html(`<!doctype html><html lang="pt-BR"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Agendar atendimento</title><style>body{font-family:Arial;background:#fff8f7;color:#35252c;padding:16px}main{max-width:520px;margin:auto}.card{background:white;padding:20px;border-radius:15px;border:1px solid #eadde2}h1{color:var(--accent,#a34370)}label{display:block;font-weight:bold;margin:15px 0 6px}input,select{width:100%;box-sizing:border-box;padding:13px;border:1px solid #d9cbd1;border-radius:9px;font-size:16px}.slots{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.slot,button{padding:13px;border-radius:9px;border:1px solid #d9cbd1;background:white;font-weight:bold}.selected,.submit{background:var(--accent,#a34370);color:white}.submit{width:100%;margin-top:18px;border:0}p{line-height:1.5;color:#75656d}</style><main><div class="card"><h1 id="title">Agendar atendimento</h1><p id="category">Escolha o serviço e o horário.</p><form id="f"><label>Serviço</label><select id="service" required></select><label>Data</label><input id="date" type="date" required><label>Horários disponíveis</label><div id="slots" class="slots"></div><input id="time" type="hidden" required><label>Seu nome</label><input id="name" maxlength="100" required><label>WhatsApp com DDD</label><input id="phone" maxlength="25" type="tel" required><button class="submit">Solicitar agendamento</button><p id="msg"></p></form></div></main><script>
+const $=id=>document.getElementById(id);let chosen="";date.min=new Intl.DateTimeFormat("en-CA",{timeZone:"America/Sao_Paulo",year:"numeric",month:"2-digit",day:"2-digit"}).format(new Date());
+async function slots(){chosen="";time.value="";slotsBox.replaceChildren();if(!service.value||!date.value)return;try{let r=await fetch("/api/availability?"+new URLSearchParams({date:date.value,service_id:service.value}));let d=await r.json();if(!r.ok)throw Error(d.error);if(!d.slots.length){slotsBox.textContent="Sem horários disponíveis.";return}d.slots.forEach(t=>{let b=document.createElement("button");b.type="button";b.className="slot";b.textContent=t;b.onclick=()=>{document.querySelectorAll(".slot").forEach(x=>x.classList.remove("selected"));b.classList.add("selected");chosen=t;time.value=t};slotsBox.append(b)})}catch(e){msg.textContent=e.message}}
+const slotsBox=$("slots");service.onchange=slots;date.onchange=slots;
+fetch("/api/public-config").then(async r=>{let d=await r.json();if(!r.ok)throw Error(d.error);title.textContent=d.professional.name;category.textContent=d.professional.category;document.documentElement.style.setProperty("--accent",d.professional.accent_color||"#a34370");service.innerHTML='<option value="">Selecione</option>';d.services.forEach(s=>{let o=document.createElement("option");o.value=s.id;o.textContent=s.name+" — R$ "+Number(s.price).toFixed(2).replace(".",",")+" ("+s.duration+" min)";service.append(o)})}).catch(e=>msg.textContent=e.message);
+f.onsubmit=async e=>{e.preventDefault();if(!chosen){msg.textContent="Escolha um horário.";return}msg.textContent="Enviando...";try{let r=await fetch("/api/appointments",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({service_id:service.value,date:date.value,time:chosen,customer_name:name.value.trim(),customer_phone:phone.value.trim()})});let d=await r.json();if(!r.ok)throw Error(d.error);msg.textContent="Solicitação registrada! A profissional ainda precisa confirmar.";f.reset();slotsBox.replaceChildren();chosen=""}catch(e){msg.textContent=e.message;await slots()}}</script></html>`);
     }
-
-    const html = `<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Agenda Beauty - Configuração</title><style>
-*{box-sizing:border-box}body{margin:0;font-family:Arial,sans-serif;background:#fff8f7;color:#35252c}
-header{background:white;padding:20px 16px;border-bottom:1px solid #eee}header h1{margin:0;color:#a34370;font-size:25px}
-main{max-width:720px;margin:auto;padding:20px 16px 40px}h2{font-size:23px;margin:8px 0}p{line-height:1.5;color:#75656d}
-.card{background:white;padding:18px;border:1px solid #eadde2;border-radius:16px;margin:16px 0}
-label{display:block;font-weight:bold;font-size:14px;margin:15px 0 7px}
-input,select{width:100%;padding:13px;border:1px solid #d9cbd1;border-radius:10px;font-size:16px;background:white;color:#35252c}
-button{border:0;border-radius:10px;padding:13px 16px;font-weight:bold;font-size:15px;cursor:pointer}
-.primary{background:#a34370;color:white;width:100%;margin-top:16px}.secondary{background:#f8eaf0;color:#84365c;margin-top:12px}
-.service{padding:12px 0;border-bottom:1px solid #eee}.service:last-child{border:0}.small{font-size:13px;color:#75656d}
-.preview{border:2px dashed #d8b6c5;border-radius:15px;padding:18px;background:#fffafb}.preview h3{margin-top:0}
-.preview button{background:var(--accent,#a34370);color:white;width:100%;margin-top:10px}.pill{display:inline-block;background:#f8eaf0;border-radius:20px;padding:7px 10px;margin:4px;font-size:13px}
-.notice{font-size:13px;background:#fff4d9;padding:12px;border-radius:10px;color:#694e17}#status{padding:10px;border-radius:8px}
-.publicLink{display:block;overflow-wrap:anywhere;margin-top:10px;color:#84365c}
-</style></head><body><header><h1>Agenda Beauty</h1></header><main>
-<section class="card"><h2>Configure seu negócio</h2><p>Configure os dados do seu espaço e os serviços que oferece.</p>
-<label for="professional">Nome profissional ou estúdio</label><input id="professional" placeholder="Ex.: Studio da Maria">
-<label for="category">Tipo de atendimento</label><select id="category"><option>Unhas</option><option>Cílios</option><option>Sobrancelhas</option><option>Depilação</option><option>Estética</option><option>Mais de uma categoria</option></select>
-<label for="accent">Cor principal da página</label><input id="accent" type="color" value="#a34370"></section>
-<section class="card"><h2>Seus serviços</h2><p>Adicione os procedimentos, preços e duração.</p>
-<label for="serviceName">Nome do serviço</label><input id="serviceName" placeholder="Ex.: Manicure">
-<label for="price">Preço em reais (R$)</label><input id="price" type="number" min="0" step="0.01" placeholder="Ex.: 35">
-<label for="duration">Duração</label><select id="duration"><option value="30">30 minutos</option><option value="45">45 minutos</option><option value="60" selected>1 hora</option><option value="90">1 hora e 30 minutos</option><option value="120">2 horas</option></select>
-<button class="secondary" id="addService" type="button">+ Adicionar serviço</button><div id="serviceList"><p class="small">Carregando serviços...</p></div></section>
-<section class="card"><h2>Horários de atendimento</h2><label for="days">Dias em que atende</label><select id="days"><option>Segunda a sexta</option><option>Segunda a sábado</option><option>Todos os dias</option><option>Personalizar depois</option></select>
-<div style="display:flex;gap:12px"><div style="flex:1"><label for="start">Começa às</label><input id="start" type="time" value="09:00"></div><div style="flex:1"><label for="end">Termina às</label><input id="end" type="time" value="18:00"></div></div>
-<label for="prep">Tempo de preparação entre clientes (minutos)</label><input id="prep" type="number" min="0" max="180" step="1" value="10">
-<p class="small">Tempo para organizar o espaço e se preparar para a próxima cliente. Use 0 se não precisar de intervalo. Aceita de 0 a 180 minutos.</p>
-<p class="small">A grade começa em intervalos de 30 minutos e também pode oferecer o horário exato após o fim de um atendimento e da preparação.</p></section>
-<section class="card"><h2>Agendamentos futuros</h2><p class="small">Veja os próximos atendimentos e abra o WhatsApp com uma mensagem pronta. Você ainda precisa tocar em enviar no WhatsApp.</p><button class="secondary" id="refreshAppointments" type="button">Atualizar agendamentos</button><div id="appointmentsList"><p class="small">Toque em “Atualizar agendamentos”.</p></div></section>
-<section class="card"><h2>Prévia da sua página</h2><p class="small">Exemplo de como suas clientes poderão visualizar os serviços.</p>
-<div class="preview" id="preview"><h3 id="previewName">Seu espaço de beleza</h3><span class="pill" id="previewCategory">Unhas</span><div id="previewServices"><p>Seus serviços aparecerão aqui.</p></div>
-<p id="previewHours" class="small">Segunda a sexta - 09:00 às 18:00</p><button type="button" id="previewButton">Abrir página de agendamento</button></div>
-<button class="secondary" id="updatePreview" type="button" style="width:100%">Atualizar prévia</button><button class="primary" id="saveButton" type="button">Salvar configuração</button>
-<p id="status" role="status">Carregando dados...</p><p class="notice">Página pública para clientes:</p><a class="publicLink" href="/agendar" target="_blank">https://agenda-beauty.ffdbeats.workers.dev/agendar</a>
-<p class="notice">Os pedidos ficam salvos no banco. A confirmação ainda precisa ser feita pela profissional. Este teste atende uma profissional.</p></section>
-</main><script>
+    if (url.pathname === "/" && method === "GET") {
+      // Interface administrativa simplificada, protegida por login.
+      return html(`<!doctype html><html lang="pt-BR"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Agenda Beauty</title><style>body{font-family:Arial;background:#fff8f7;color:#35252c;margin:0}header{background:white;padding:18px;border-bottom:1px solid #eadde2;display:flex;justify-content:space-between;align-items:center;gap:10px}h1,h2{color:#a34370}main{max-width:720px;margin:auto;padding:18px}.card{background:white;border:1px solid #eadde2;border-radius:14px;padding:18px;margin:14px 0}label{display:block;font-weight:bold;margin:13px 0 6px}input,select{width:100%;box-sizing:border-box;padding:12px;border:1px solid #d9cbd1;border-radius:9px;font-size:16px}button{padding:12px;border:0;border-radius:9px;background:#a34370;color:white;font-weight:bold;margin-top:10px}.service{padding:10px 0;border-bottom:1px solid #eee}.secondary{background:#f8eaf0;color:#84365c}.row{display:flex;gap:10px}.row>div{flex:1;min-width:0}a{color:#84365c;overflow-wrap:anywhere}p{line-height:1.5;color:#75656d}</style><header><h1>Agenda Beauty</h1><a href="/sair">Sair</a></header><main><section class="card"><h2>Configuração</h2><label>Nome do espaço</label><input id="business" placeholder="Studio da Maria"><label>Tipo de atendimento</label><input id="category" placeholder="Unhas, cílios, etc."><label>Cor da página</label><input id="accent" type="color" value="#a34370"><div class="row"><div><label>Dias</label><select id="days"><option>Segunda a sexta</option><option>Segunda a sábado</option><option>Todos os dias</option></select></div><div><label>Preparação (min)</label><input id="prep" type="number" min="0" max="180" value="10"></div></div><div class="row"><div><label>Abre</label><input id="start" type="time" value="09:00"></div><div><label>Fecha</label><input id="end" type="time" value="18:00"></div></div></section><section class="card"><h2>Adicionar serviço</h2><label>Nome</label><input id="sn" placeholder="Manicure"><div class="row"><div><label>Preço (R$)</label><input id="price" type="number" min="0" step=".01"></div><div><label>Duração (min)</label><input id="duration" type="number" min="1" max="1440" value="60"></div></div><button id="add">Adicionar serviço</button><div id="services"></div><button id="save">Salvar configuração</button><p id="status"></p></section><section class="card"><h2>Próximos agendamentos</h2><button id="refresh" class="secondary">Atualizar</button><div id="appointments"></div><p>Link público de teste: <a href="/agendar" target="_blank">Abrir página de agendamento</a></p></section></main><script>
 const $=id=>document.getElementById(id);let services=[];
-function renderServices(){const list=$("serviceList"),preview=$("previewServices");if(!services.length){list.innerHTML='<p class="small">Nenhum serviço adicionado ainda.</p>';preview.innerHTML='<p>Seus serviços aparecerão aqui.</p>';return;}
-list.replaceChildren();preview.replaceChildren();services.forEach((service,index)=>{const item=document.createElement("div");item.className="service";const title=document.createElement("strong");title.textContent=service.name;
-const detail=document.createElement("p");detail.className="small";detail.textContent="R$ "+Number(service.price).toFixed(2).replace(".",",")+" - "+service.duration+" min";
-const remove=document.createElement("button");remove.className="secondary";remove.textContent="Remover";remove.type="button";remove.onclick=()=>{services.splice(index,1);renderServices();};
-item.append(title,detail,remove);list.appendChild(item);const previewItem=document.createElement("div");previewItem.className="service";const previewTitle=document.createElement("strong");previewTitle.textContent=service.name;
-const previewDetail=document.createElement("p");previewDetail.className="small";previewDetail.textContent=detail.textContent;previewItem.append(previewTitle,previewDetail);preview.appendChild(previewItem);});}
-async function loadAppointments(){const box=$("appointmentsList");if(!box)return;box.textContent="Carregando agendamentos...";try{const response=await fetch("/api/appointments");const data=await response.json();if(!response.ok)throw new Error(data.error||"Falha ao carregar");box.replaceChildren();const appointments=data.appointments||[];if(!appointments.length){box.innerHTML='<p class="small">Nenhum agendamento futuro encontrado.</p>';return;}appointments.forEach(a=>{const card=document.createElement("div");card.className="service";const date=String(a.appointment_date||"").split("-").reverse().join("/");const title=document.createElement("strong");title.textContent=date+" às "+a.appointment_time+" — "+a.service_name;const detail=document.createElement("p");detail.className="small";detail.textContent=(a.customer_name||"Cliente")+" · "+(a.customer_phone||"Sem telefone");const link=document.createElement("a");link.className="secondary";link.target="_blank";link.rel="noopener";const phone=String(a.customer_phone||"").replace(/\D/g,"");const message="Oi, "+(a.customer_name||"")+"! Passando para lembrar do seu horário em "+date+" às "+a.appointment_time+" para "+a.service_name+". Você confirma sua presença?";link.href="https://wa.me/"+(phone.startsWith("55")?phone:"55"+phone)+"?text="+encodeURIComponent(message);link.textContent="Enviar confirmação pelo WhatsApp";if(!phone){link.removeAttribute("href");link.textContent="Telefone da cliente não informado";}card.append(title,detail,link);box.appendChild(card);});}catch(error){box.textContent="Erro ao carregar os agendamentos: "+error.message;}}
-$("refreshAppointments")?.addEventListener("click",loadAppointments);
-
-function updatePreview(){$("previewName").textContent=$("professional").value.trim()||"Seu espaço de beleza";$("previewCategory").textContent=$("category").value;
-$("previewHours").textContent=$("days").value+" - "+$("start").value+" às "+$("end").value;document.documentElement.style.setProperty("--accent",$("accent").value);$("previewButton").style.background=$("accent").value;}
-$("addService").addEventListener("click",()=>{const name=$("serviceName").value.trim(),priceText=$("price").value,price=Number(priceText),duration=Number($("duration").value);
-if(!name){alert("Digite o nome do serviço.");return;}if(name.startsWith("[Arquivado] ")){alert("Escolha outro nome para o serviço.");return;}
-if(services.some(s=>s.name.toLowerCase()===name.toLowerCase())){alert("Você já adicionou um serviço com esse nome.");return;}
-if(priceText===""||!Number.isFinite(price)||price<0){alert("Digite um preço válido.");return;}services.push({name,price,duration});$("serviceName").value="";$("price").value="";renderServices();});
-$("updatePreview").addEventListener("click",updatePreview);
-["professional","category","accent","days","start","end","prep"].forEach(id=>{$(id).addEventListener("input",updatePreview);$(id).addEventListener("change",updatePreview);});
-$("previewButton").addEventListener("click",()=>window.open("/agendar","_blank"));
-$("saveButton").addEventListener("click",async()=>{const button=$("saveButton");button.disabled=true;$("status").textContent="Salvando no banco de dados...";updatePreview();
-try{const response=await fetch("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({
-name:$("professional").value.trim(),category:$("category").value,accent:$("accent").value,days:$("days").value,start:$("start").value,end:$("end").value,
-prep_minutes:Number($("prep").value),services})});const result=await response.json();if(!response.ok)throw new Error(result.error||"Falha ao salvar.");$("status").textContent="Configuração salva com sucesso!";
-}catch(error){$("status").textContent="Não foi possível salvar: "+error.message;}finally{button.disabled=false;}});
-async function loadConfig(){try{const response=await fetch("/api/config");const data=await response.json();if(!response.ok)throw new Error(data.error||"Falha ao carregar.");
-if(!data.configured){$("status").textContent="Configure seu negócio e toque em Salvar configuração.";updatePreview();renderServices();return;}
-const p=data.professional;$("professional").value=p.name||"";$("category").value=p.category||"Unhas";$("accent").value=p.accent_color||"#a34370";$("days").value=p.work_days||"Segunda a sexta";
-$("start").value=p.start_time||"09:00";$("end").value=p.end_time||"18:00";$("prep").value=p.prep_minutes??10;
-services=(data.services||[]).map(s=>({name:s.name,price:Number(s.price),duration:Number(s.duration)}));renderServices();updatePreview();$("status").textContent="Dados carregados do banco de dados.";
-}catch(error){$("status").textContent="Erro ao carregar os dados: "+error.message;}}
-updatePreview();loadConfig();loadAppointments();
-</script></body></html>`;
-    return new Response(html, { headers: { "Content-Type": "text/html; charset=UTF-8" } });
+function render(){servicesBox.replaceChildren();services.forEach((s,i)=>{let d=document.createElement("div");d.className="service";let t=document.createElement("b");t.textContent=s.name;let p=document.createElement("p");p.textContent="R$ "+Number(s.price).toFixed(2).replace(".",",")+" · "+s.duration+" min";let b=document.createElement("button");b.className="secondary";b.textContent="Remover";b.onclick=()=>{services.splice(i,1);render()};d.append(t,p,b);servicesBox.append(d)})}
+const servicesBox=$("services");
+$("add").onclick=()=>{let n=$("sn").value.trim(),p=$("price").value,d=Number($("duration").value);if(!n||p===""||!Number.isFinite(Number(p))||Number(p)<0||!Number.isInteger(d)||d<1||d>1440){alert("Confira nome, preço e duração.");return}if(services.some(s=>s.name.toLowerCase()===n.toLowerCase())){alert("Já existe um serviço com esse nome.");return}services.push({name:n,price:Number(p),duration:d});$("sn").value="";$("price").value="";render()};
+$("save").onclick=async()=>{let b=$("save");b.disabled=true;status.textContent="Salvando...";try{let r=await fetch("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:business.value.trim(),category:category.value.trim(),accent:accent.value,days:days.value,start:start.value,end:end.value,prep_minutes:Number(prep.value),services})});let d=await r.json();if(!r.ok)throw Error(d.error);status.textContent="Salvo!";await load()}catch(e){status.textContent=e.message}finally{b.disabled=false}};
+async function load(){try{let r=await fetch("/api/config");let d=await r.json();if(!r.ok)throw Error(d.error);if(d.configured){let p=d.professional;business.value=p.name||"";category.value=p.category||"";accent.value=p.accent_color||"#a34370";days.value=["Segunda a sexta","Segunda a sábado","Todos os dias"].includes(p.work_days)?p.work_days:"Segunda a sexta";start.value=p.start_time||"09:00";end.value=p.end_time||"18:00";prep.value=p.prep_minutes??10;services=(d.services||[]).map(s=>({name:s.name,price:Number(s.price),duration:Number(s.duration)}));render();status.textContent="Dados carregados."}else status.textContent="Configure o espaço e adicione serviços."}catch(e){status.textContent=e.message}}
+$("refresh").onclick=async()=>{appointments.textContent="Carregando...";try{let r=await fetch("/api/appointments");let d=await r.json();if(!r.ok)throw Error(d.error);appointments.replaceChildren();if(!d.appointments.length){appointments.textContent="Nenhum agendamento futuro.";return}d.appointments.forEach(a=>{let div=document.createElement("div");div.className="service";let b=document.createElement("b");b.textContent=a.appointment_date.split("-").reverse().join("/")+" às "+a.appointment_time+" — "+a.service_name;let p=document.createElement("p");p.textContent=a.customer_name+" · "+a.customer_phone;div.append(b,p);appointments.append(div)})}catch(e){appointments.textContent=e.message}};
+load();
+</script></html>`);
+    }
+    return new Response("Não encontrado.", { status: 404 });
   }
 };

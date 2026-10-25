@@ -112,7 +112,7 @@ export default {
           });
           const contentType=response.headers.get("content-type")||"";
           if(!contentType.includes("application/json")){
-            const body=(await response.text()).slice(0,160).replace(/\s+/g," ");
+            const body=(await response.text()).slice(0,160).replace(/\\s+/g," ");
             throw Error("O servidor respondeu com conteúdo inesperado (HTTP "+response.status+"). Confira se o Worker correto está publicado. "+body);
           }
           const data=await response.json();

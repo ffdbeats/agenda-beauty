@@ -92,7 +92,39 @@ export default {
       return html(`<!doctype html><html lang="pt-BR"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Entrar — Agenda Beauty</title>
       <style>body{font-family:Arial;background:#fff8f7;color:#35252c;padding:20px}main{max-width:420px;margin:8vh auto;background:white;border:1px solid #eadde2;border-radius:16px;padding:22px}h1{color:#a34370}label{display:block;margin:15px 0 6px;font-weight:bold}input{width:100%;box-sizing:border-box;padding:13px;border:1px solid #d9cbd1;border-radius:9px;font-size:16px}button{margin-top:18px;width:100%;padding:14px;background:#a34370;color:white;border:0;border-radius:9px;font-weight:bold;font-size:16px}p{line-height:1.5;color:#75656d}</style>
       <main><h1>Agenda Beauty</h1><p>Entre para configurar sua agenda.</p><form id="f"><label>E-mail</label><input id="email" type="email" autocomplete="username" required><label>Senha</label><input id="password" type="password" autocomplete="current-password" required><button>Entrar</button><p id="msg" role="status"></p></form></main>
-      <script>f.onsubmit=async e=>{e.preventDefault();msg.textContent="Verificando...";try{let r=await fetch("/api/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({email:email.value,password:password.value})});let d=await r.json();if(!r.ok)throw Error(d.error||"Não foi possível entrar");location.href="/"}catch(e){msg.textContent=e.message}}</script></html>`);
+      <script>
+      const loginForm=document.getElementById("f");
+      const loginEmail=document.getElementById("email");
+      const loginPassword=document.getElementById("password");
+      const loginMessage=document.getElementById("msg");
+      loginForm.addEventListener("submit",async event=>{
+        event.preventDefault();
+        loginMessage.textContent="Verificando...";
+        const button=loginForm.querySelector("button");
+        button.disabled=true;
+        try{
+          const response=await fetch("/api/login",{
+            method:"POST",
+            headers:{"Content-Type":"application/json","Accept":"application/json"},
+            credentials:"same-origin",
+            cache:"no-store",
+            body:JSON.stringify({email:loginEmail.value.trim(),password:loginPassword.value})
+          });
+          const contentType=response.headers.get("content-type")||"";
+          if(!contentType.includes("application/json")){
+            const body=(await response.text()).slice(0,160).replace(/\s+/g," ");
+            throw Error("O servidor respondeu com conteúdo inesperado (HTTP "+response.status+"). Confira se o Worker correto está publicado. "+body);
+          }
+          const data=await response.json();
+          if(!response.ok)throw Error(data.error||"Não foi possível entrar (HTTP "+response.status+").");
+          window.location.assign("/");
+        }catch(error){
+          loginMessage.textContent=error.message||"Não foi possível conectar. Tente novamente.";
+        }finally{
+          button.disabled=false;
+        }
+      });
+      </script></html>`);
     }
     if (url.pathname === "/configurar-acesso" && method === "GET") {
       const count = await env.DB.prepare("SELECT COUNT(*) AS n FROM users").first();
@@ -124,7 +156,15 @@ export default {
       const email = String(data.email||"").trim().toLowerCase();
       const password = String(data.password||"");
       if (!email || !password || email.length > 254 || password.length > 200) return json({error:"Confira o e-mail e a senha."},400);
-      const user = await env.DB.prepare("SELECT id,salon_id,email,password_hash,role,status FROM users WHERE email = ?").bind(email).first();
+      let user;
+      try {
+        user = await env.DB.prepare("SELECT id,salon_id,email,password_hash,role,status FROM users WHERE lower(email) = ?").bind(email).first();
+      } catch (error) {
+        // Keep the failure in JSON so the login screen can show a useful message
+        // instead of failing with "Unexpected token '<'" while parsing an HTML 500 page.
+        console.error("Agenda Beauty login database query failed:", error);
+        return json({error:"Não foi possível consultar o usuário no D1. Verifique se a tabela users contém as colunas id, salon_id, email, password_hash, role e status."},500);
+      }
       if (!user || user.status !== "active" || !await passwordMatches(password,user.password_hash))
         return json({error:"E-mail ou senha incorretos."},401);
       if (user.role !== "salon_owner" && user.role !== "platform_admin") return json({error:"Este usuário não tem permissão para acessar esta área."},403);

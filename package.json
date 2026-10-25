@@ -1,0 +1,17 @@
+{
+  "name": "agenda-beauty",
+  "version": "0.1.0",
+  "private": true,
+  "description": "SaaS de agendamento para profissionais da beleza com Cloudflare Workers e D1.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:local": "wrangler d1 migrations apply agenda-beauty-db --local",
+    "db:remote:status": "wrangler d1 migrations list agenda-beauty-db --remote",
+    "db:remote:apply": "wrangler d1 migrations apply agenda-beauty-db --remote",
+    "check": "node --check src/index.js"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

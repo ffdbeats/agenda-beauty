@@ -1,0 +1,4 @@
+# Copie para .dev.vars apenas para desenvolvimento local.
+# Gere valores fortes e nunca envie o arquivo .dev.vars ao GitHub.
+SESSION_SECRET="substitua-por-um-segredo-aleatorio-forte"
+SETUP_SECRET="substitua-por-uma-chave-de-configuracao-forte"

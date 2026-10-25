@@ -129,7 +129,40 @@ export default {
     if (url.pathname === "/configurar-acesso" && method === "GET") {
       const count = await env.DB.prepare("SELECT COUNT(*) AS n FROM users").first();
       if (Number(count?.n || 0) > 0) return html("<h1>Configuração inicial já encerrada.</h1>", 410);
-      return html(`<!doctype html><html lang="pt-BR"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Criar acesso</title><style>body{font-family:Arial;background:#fff8f7;padding:20px;color:#35252c}main{max-width:440px;margin:auto;background:white;padding:22px;border-radius:15px}label{display:block;margin:14px 0 6px;font-weight:bold}input{width:100%;box-sizing:border-box;padding:12px;border:1px solid #d9cbd1;border-radius:8px;font-size:16px}button{margin-top:18px;padding:13px;background:#a34370;color:white;border:0;border-radius:8px;width:100%;font-weight:bold}</style><main><h1>Criar primeiro acesso</h1><p>Esta página só funciona enquanto ainda não existe nenhum usuário.</p><form id="f"><label>Chave de configuração (SETUP_SECRET)</label><input id="setupSecret" type="password" required><label>Seu e-mail</label><input id="email" type="email" required><label>Crie uma senha (mínimo 12 caracteres)</label><input id="password" type="password" minlength="12" required><button>Criar acesso</button><p id="msg"></p></form></main><script>f.onsubmit=async e=>{e.preventDefault();msg.textContent="Criando acesso...";try{let r=await fetch("/api/setup-owner",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({setupSecret:setupSecret.value,email:email.value,password:password.value})});let d=await r.json();if(!r.ok)throw Error(d.error||"Falha");location.href="/login"}catch(e){msg.textContent=e.message}}</script></html>`);
+      return html(`<!doctype html><html lang="pt-BR"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Criar acesso</title><style>body{font-family:Arial;background:#fff8f7;padding:20px;color:#35252c}main{max-width:440px;margin:auto;background:white;padding:22px;border-radius:15px}label{display:block;margin:14px 0 6px;font-weight:bold}input{width:100%;box-sizing:border-box;padding:12px;border:1px solid #d9cbd1;border-radius:8px;font-size:16px}button{margin-top:18px;padding:13px;background:#a34370;color:white;border:0;border-radius:8px;width:100%;font-weight:bold}</style><main><h1>Criar primeiro acesso</h1><p>Esta página só funciona enquanto ainda não existe nenhum usuário.</p><form id="f"><label>Chave de configuração (SETUP_SECRET)</label><input id="setupSecret" type="password" required><label>Seu e-mail</label><input id="email" type="email" required><label>Crie uma senha (mínimo 12 caracteres)</label><input id="password" type="password" minlength="12" required><button>Criar acesso</button><p id="msg"></p></form></main><script>
+      const setupForm=document.getElementById("f");
+      const setupSecretInput=document.getElementById("setupSecret");
+      const setupEmailInput=document.getElementById("email");
+      const setupPasswordInput=document.getElementById("password");
+      const setupMessage=document.getElementById("msg");
+      setupForm.addEventListener("submit",async event=>{
+        event.preventDefault();
+        setupMessage.textContent="Criando acesso...";
+        const button=setupForm.querySelector("button");
+        button.disabled=true;
+        try{
+          const response=await fetch("/api/setup-owner",{
+            method:"POST",
+            headers:{"Content-Type":"application/json","Accept":"application/json"},
+            credentials:"same-origin",
+            cache:"no-store",
+            body:JSON.stringify({setupSecret:setupSecretInput.value,email:setupEmailInput.value.trim(),password:setupPasswordInput.value})
+          });
+          const contentType=response.headers.get("content-type")||"";
+          if(!contentType.includes("application/json")){
+            const body=(await response.text()).slice(0,160).replace(/\\s+/g," ");
+            throw Error("Resposta inesperada do servidor (HTTP "+response.status+"). "+body);
+          }
+          const data=await response.json();
+          if(!response.ok)throw Error(data.error||"Falha ao criar acesso.");
+          window.location.assign("/login");
+        }catch(error){
+          setupMessage.textContent=error.message||"Não foi possível criar o acesso.";
+        }finally{
+          button.disabled=false;
+        }
+      });
+      </script></html>`);
     }
     if (url.pathname === "/api/setup-owner" && method === "POST") {
       if (!env.SETUP_SECRET || !env.SESSION_SECRET) return json({error:"Configure os segredos SETUP_SECRET e SESSION_SECRET no Cloudflare."},500);

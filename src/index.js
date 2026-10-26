@@ -26,14 +26,14 @@ async function hmac(secret, value) {
 async function passwordHash(password, salt) {
   const key = await crypto.subtle.importKey("raw", encoder.encode(password), "PBKDF2", false, ["deriveBits"]);
   const bits = await crypto.subtle.deriveBits({
-    name: "PBKDF2", salt: encoder.encode(salt), iterations: 210000, hash: "SHA-256"
+    name: "PBKDF2", salt: encoder.encode(salt), iterations: 100000, hash: "SHA-256"
   }, key, 256);
-  return "pbkdf2$210000$" + salt + "$" + b64url(bits);
+  return "pbkdf2$100000$" + salt + "$" + b64url(bits);
 }
 async function passwordMatches(password, stored) {
   try {
     const [kind, rounds, salt, expected] = stored.split("$");
-    if (kind !== "pbkdf2" || Number(rounds) !== 210000 || !salt || !expected) return false;
+    if (kind !== "pbkdf2" || Number(rounds) !== 100000 || !salt || !expected) return false;
     const actual = await passwordHash(password, salt);
     return actual === stored;
   } catch { return false; }

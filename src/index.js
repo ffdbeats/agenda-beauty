@@ -262,9 +262,8 @@ export default {
         const salon=await publicSalon(); if(!salon) return json({error:"Link de agendamento inválido. Peça à profissional o link correto."},404);
         await env.DB.prepare("CREATE TABLE IF NOT EXISTS salon_settings (salon_id INTEGER PRIMARY KEY, confirmation_mode TEXT NOT NULL DEFAULT 'manual')").run();
         const setting=await env.DB.prepare("SELECT confirmation_mode FROM salon_settings WHERE salon_id=?").bind(salon.id).first();
-        const p=await env.DB.prepare("SELECT name,category,accent_color,work_days,start_time,end_time,prep_minutes FROM professionals WHERE salon_id=? ORDER BY id LIMIT 1").bind(salon.id).first();
-        if(!p) return json({error:"Este espaço ainda não foi configurado pela profissional."},404);
-        const professional=await env.DB.prepare("SELECT id FROM professionals WHERE salon_id=? ORDER BY id LIMIT 1").bind(salon.id).first();
+        const professional=await env.DB.prepare("SELECT id,name,category,accent_color,work_days,start_time,end_time,prep_minutes FROM professionals WHERE salon_id=? ORDER BY id LIMIT 1").bind(salon.id).first();
+        if(!professional) return json({error:"Este espaço ainda não foi configurado pela profissional."},404);
         const services=await env.DB.prepare("SELECT id,name,price,duration FROM services WHERE salon_id=? AND professional_id=? AND name NOT LIKE '[Arquivado] %' ORDER BY id").bind(salon.id,professional.id).all();
         return json({salon:{name:salon.name,slug:salon.slug},professional,services:services.results,confirmation_mode:setting?.confirmation_mode||"manual"});
       } catch { return json({error:"Não foi possível carregar os serviços."},500); }
